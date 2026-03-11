@@ -1,5 +1,8 @@
 import getpass
 import os
+
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.runnables import RunnableWithMessageHistory
 from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 from langchain_classic import hub
@@ -8,6 +11,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import OpenAIEmbeddings
 from langchain_openai import ChatOpenAI
+from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_classic.chains import (
     create_history_aware_retriever,
     create_retrieval_chain,
@@ -71,11 +75,21 @@ def get_retriever():
 #     return qa_chain
 
 
-def get_qa_chain():
+# Chatting History를 얹어주는 방식
+##1. 딕셔너리로 관리하는 방법 -> 종료되면 메모리가 날아감
+store={}  # session_id를 키로, BaseChatMessageHistory 객체를 값으로 저장하는 딕셔너리
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
+    
+
+def get_rag_chain():
 
     llm = get_llm()
     retriever = get_retriever()
 
+    # 새로운 qa_chain 프롬프트####################
     # Contextualize question
     contextualize_q_system_prompt = (
         "Given a chat history and the latest user question "
@@ -92,12 +106,13 @@ def get_qa_chain():
             ("human", "{input}"),
         ]
     )
-
+    ########################################
     # retriever
     history_aware_retriever = create_history_aware_retriever(
         llm, retriever, contextualize_q_prompt
     )
 
+    # chain ##################################################################
     # Answer question
     qa_system_prompt = (
         "You are an assistant for question-answering tasks. Use "
@@ -116,21 +131,38 @@ def get_qa_chain():
         ]
     )
     
-    # chain
     question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    ##################################################################
+
+    # chat_history
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain, 
+        get_session_history,  # 채팅 히스토리까지 포함된 history_aware_retriever를 활용해서 원하는 기능을 구현할 수 있음
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",).pick('answer')   # ['answer] 로 해도 되는데, streaming 할때 안좋다 (에러)
+    
+    
+    return conversational_rag_chain
 
 
-    return rag_chain
 
-
-
-def get_ai_message(user_message):
+def get_ai_response(user_message):
 
     dictionary_chain = get_dictionary_chain()
-    qa_chain = get_qa_chain()
+    rag_chain = get_rag_chain()
     
-    tax_chain = {"query" : dictionary_chain} | qa_chain  
-    ai_message = tax_chain.invoke({"question" : user_message})  # 질문이 사용자 쿼리임
+    # tax_chain = {"query" : dictionary_chain} | rag_chain  
+    tax_chain = {"input" : dictionary_chain} | rag_chain  
+    ai_response = tax_chain.stream(   # invoke -> stream으로 변경 : Iterator로 바뀐다.
+        {
+            "question" : user_message
+        },
+        config={
+            "configurable" : {"session_id" : "abc123"}   # Missing Key 'session_id' in configurable -> expected keys are[session_id] 관련 ValueError
+        },
+        )  # 질문이 사용자 쿼리임
 
-    return ai_message['result']
+    # return ai_message['result']
+    return ai_response   # or pick을 활용
